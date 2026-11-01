@@ -421,12 +421,18 @@ class GcpOpsClient:
         now_utc = datetime.now(UTC)
         start_utc = now_utc - timedelta(minutes=max(minutes, 1))
         filter_expr = f'metric.type = "{metric_type}"'
+        if metric_type == METRIC_MEMORY_PERCENT:
+            filter_expr += ' AND metric.labels.state = "used"'
+        elif metric_type == METRIC_DISK_PERCENT:
+            filter_expr += (
+                ' AND metric.labels.state = "used" AND metric.labels.device != "/dev/sda15"'
+            )
         params = urllib.parse.urlencode(
             {
                 "filter": filter_expr,
                 "interval.startTime": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "interval.endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "pageSize": str(min(max(minutes * 10, 50), 500)),
+                "pageSize": str(min(max(minutes * 50, 500), 1000)),
             }
         )
         url = f"{MONITORING_BASE_URL}/projects/{self.project_id}/timeSeries?{params}"
