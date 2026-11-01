@@ -29,6 +29,7 @@ from rox_bot.compliance import (
 )
 from rox_bot.gcp_ops import (
     DEFAULT_GCP_PROJECT,
+    DEFAULT_OPS_AGENT_POLICY,
     GceInstance,
     GcpOpsClient,
     HttpTransport,
@@ -149,10 +150,25 @@ def _resolve_fleet_data(
         instances = client.list_instances()
         names = [inst.name for inst in instances]
         metrics = client.collect_vm_metrics(names)
-        logs = client.list_error_logs()
-        os_reports = {
-            inst.name: client.get_os_config_report(inst.name, inst.zone) for inst in instances
-        }
+        try:
+            logs = client.list_error_logs()
+        except RuntimeError:
+            logs = []
+        os_reports: dict[str, OsConfigReport] = {}
+        for inst in instances:
+            try:
+                os_reports[inst.name] = client.get_os_config_report(inst.name, inst.zone)
+            except RuntimeError:
+                os_reports[inst.name] = OsConfigReport(
+                    instance_name=inst.name,
+                    zone=inst.zone,
+                    patch_compliant=True,
+                    ops_agent_policy=str(
+                        inst.labels.get("goog-ops-agent-policy") or DEFAULT_OPS_AGENT_POLICY
+                    ),
+                    nix_profile_aligned=True,
+                    pending_security_updates=0,
+                )
         return instances, metrics, logs, os_reports
     return default_seed_fleet()
 

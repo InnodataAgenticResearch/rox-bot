@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -367,6 +368,7 @@ class GcpOpsClient:
         self.project_id = project_id.strip() or DEFAULT_GCP_PROJECT
         self.transport: HttpTransport = UrllibHttpTransport() if transport is None else transport
         self.timeout = timeout
+        self._instance_id_to_name: dict[str, str] = {}
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -397,9 +399,13 @@ class GcpOpsClient:
                     if isinstance(raw_list, list):
                         for raw_inst in raw_list:
                             if isinstance(raw_inst, Mapping):
-                                instances.append(
-                                    parse_gce_instance(raw_inst, fallback_zone=fallback_zone)
+                                parsed_inst = parse_gce_instance(
+                                    raw_inst, fallback_zone=fallback_zone
                                 )
+                                raw_id = str(raw_inst.get("id") or "").strip()
+                                if raw_id:
+                                    self._instance_id_to_name[raw_id] = parsed_inst.name
+                                instances.append(parsed_inst)
         return sorted(instances, key=lambda inst: inst.name)
 
     def query_time_series(
@@ -412,10 +418,14 @@ class GcpOpsClient:
         Query Cloud Monitoring `timeSeries` (`monitoring.googleapis.com/v3`) for `metric_type`
         and return the latest point value keyed by `instance_name` (or `instance_id` / `service`).
         """
+        now_utc = datetime.now(UTC)
+        start_utc = now_utc - timedelta(minutes=max(minutes, 1))
         filter_expr = f'metric.type = "{metric_type}"'
         params = urllib.parse.urlencode(
             {
                 "filter": filter_expr,
+                "interval.startTime": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "interval.endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "pageSize": str(min(max(minutes * 10, 50), 500)),
             }
         )
@@ -443,10 +453,12 @@ class GcpOpsClient:
                     if isinstance(series.get("resource"), Mapping)
                     else {}
                 )
+                raw_inst_id = str(resource_labels.get("instance_id") or "")
+                resolved_from_id = self._instance_id_to_name.get(raw_inst_id, raw_inst_id)
                 key = str(
                     metric_labels.get("instance_name")
                     or resource_labels.get("instance_name")
-                    or resource_labels.get("instance_id")
+                    or resolved_from_id
                     or resource_labels.get("service")
                     or "project-total"
                 )

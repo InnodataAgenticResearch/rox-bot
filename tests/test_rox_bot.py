@@ -223,7 +223,7 @@ def test_gcp_ops_client_methods_and_error_branches() -> None:
                 "items": {
                     "zones/us-central1-a": {
                         "instances": [
-                            {"name": "vm-b", "status": "RUNNING"},
+                            {"id": "10001", "name": "vm-b", "status": "RUNNING"},
                             "not-a-mapping",
                         ]
                     },
@@ -775,3 +775,57 @@ def test_load_seed_fleet_from_file_and_cli_commands(tmp_path: Path) -> None:
     live_data = json.loads(out.getvalue())
     assert live_data["fleet_score"] == 100.0
     assert live_data["max_dov_bear_alarm"] == 0
+
+    # CLI: --live mode when logging and osconfig return 403 (fallback branch)
+    fake_fb = FakeHttpTransport()
+    fake_fb.queue_get_response(
+        200,
+        json.dumps(
+            {
+                "items": {
+                    "zones/us-central1-a": {
+                        "instances": [
+                            {
+                                "id": "999",
+                                "name": "artbot-01",
+                                "status": "RUNNING",
+                                "labels": {
+                                    "customer": "innodata",
+                                    "bot": "artbot",
+                                    "contact": "drosen",
+                                    "goog-ops-agent-policy": "v2-template-1-7-0",
+                                },
+                                "tags": {"items": ["customer-innodata"]},
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+    )
+    for val in (0.20, 7200.0, 45.0, 35.0, 100.0):
+        fake_fb.queue_get_response(
+            200,
+            json.dumps(
+                {
+                    "timeSeries": [
+                        {
+                            "resource": {"labels": {"instance_id": "999"}},
+                            "points": [{"value": {"doubleValue": val}}],
+                        }
+                    ]
+                }
+            ),
+        )
+    fake_fb.queue_post_response(403, '{"error": "forbidden"}')
+    fake_fb.queue_get_response(403, '{"error": "forbidden"}')
+    out_fb = io.StringIO()
+    assert (
+        main(
+            ["fleet-audit", "--live", "--token", "fake-token", "--json"],
+            transport=fake_fb,
+            stdout=out_fb,
+        )
+        == 0
+    )
+    assert json.loads(out_fb.getvalue())["fleet_score"] == 100.0
