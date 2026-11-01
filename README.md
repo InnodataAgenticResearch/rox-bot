@@ -10,7 +10,7 @@ Rox is an older, battle-hardened professional punk rock woman who rose to the to
 
 ## 1. Key Capabilities & Operating Invariants
 
-1. **Upstream ArtBOT Public Contract Lock (`UPSTREAM_ARTBOT.json`):** Pins `InnodataAgenticResearch/artbot` at tag `v0.2.0-artbot` (`3cfa4e8d2ed6c30c51f03c7a92b58df0a694c781`). `checks/api_contract.star` forbids importing internal `artbot` submodules, private underscore-prefixed symbols, or symbols not declared in `UPSTREAM_ARTBOT.json`'s `public_api_allowlist`.
+1. **Upstream ArtBOT Public Contract Lock (`UPSTREAM_ARTBOT.json`):** Pins `InnodataAgenticResearch/artbot` at tag `v0.2.0-artbot` (`6c63513a9f92887aa13ddd7f562e82eb32e87873`). `checks/api_contract.star` forbids importing internal `artbot` submodules, private underscore-prefixed symbols, or symbols not declared in `UPSTREAM_ARTBOT.json`'s `public_api_allowlist`.
 2. **Pure Dependency-Injected GCP-Native Operations Client (`src/rox_bot/gcp_ops.py`):**
    - **Cloud Compute Engine API (`compute.googleapis.com`):** Lists all instances across zones (`aggregated/instances`) in `photography-otel-sandbox`, inspecting VM status, `machineType`, boot disk image, network interfaces, metadata labels (`customer`, `bot`, `contact`, `goog-ops-agent-policy`), network tags, service account scopes, and container-optimized/shared-kernel metadata indicators.
    - **Cloud Monitoring API (`monitoring.googleapis.com/v3`):** Queries native `timeSeries` metrics (`compute.googleapis.com/instance/cpu/utilization`, `compute.googleapis.com/instance/uptime`, `agent.googleapis.com/memory/percent_used`, `agent.googleapis.com/disk/percent_used`, and `serviceruntime.googleapis.com/api/request_count`).

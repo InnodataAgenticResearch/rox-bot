@@ -16,6 +16,7 @@ from rox_bot.cli import main
 from rox_bot.compliance import (
     PILLAR_NAMES,
     audit_fleet_compliance,
+    audit_instance_compliance,
     fleet_audit_to_dict,
     render_fleet_audit_markdown,
     render_remediation_plan_markdown,
@@ -51,7 +52,7 @@ def test_package_exports_and_persona_and_upstream_pin(tmp_path: Path) -> None:
 
     pin = load_upstream_artbot_pin()
     assert pin["upstream_tag"] == "v0.2.0-artbot"
-    assert pin["upstream_commit"] == "3cfa4e8d2ed6c30c51f03c7a92b58df0a694c781"
+    assert pin["upstream_commit"] == "6c63513a9f92887aa13ddd7f562e82eb32e87873"
     for sym in (
         "CUSTOMER_LABEL_KEY",
         "FLEET_NODES_REGISTRY",
@@ -631,6 +632,102 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
     assert c_by_name["rox-ops-bot"].dov_bear_alarm_level == 2
     assert c_by_name["rox-ops-bot"].remediation_commands == (
         "artbot-gcp --project photography-otel-sandbox deploy-fleet --bot rox-ops-bot",
+    )
+
+    # 2b. Test NIX_STORE_GENERATION_DRIFT (matching and mismatched expected_bridge_store_path)
+    expected_store = "/nix/store/pzb8758pnipisza0s48f2gppzpyqh2zx-artbot-0.1.0/bin/artbot-bridge"
+    stale_store = "/nix/store/2q2xapqxrrchhj4k68989q1c9bdhq03v-artbot-0.1.0/bin/artbot-bridge"
+    aligned_vm = GceInstance(
+        name="avi-bot",
+        zone="me-west1-c",
+        status="RUNNING",
+        machine_type="e2-standard-4",
+        boot_disk_image="debian-12",
+        internal_ip="10.0.0.11",
+        external_ip="",
+        labels={
+            "customer": "innodata",
+            "bot": "avi-bot",
+            "contact": "rox",
+            "goog-ops-agent-policy": "v2-template-1-7-0",
+        },
+        network_tags=("customer-innodata",),
+        service_account_email="sa@p.iam.gserviceaccount.com",
+        service_account_scopes=("logging.write",),
+        metadata_items={},
+        nix_bridge_store_path=expected_store,
+    )
+    stale_vm = GceInstance(
+        name="bijal-bot",
+        zone="me-west1-c",
+        status="RUNNING",
+        machine_type="e2-standard-4",
+        boot_disk_image="debian-12",
+        internal_ip="10.0.0.12",
+        external_ip="",
+        labels={
+            "customer": "innodata",
+            "bot": "bijal-bot",
+            "contact": "rox",
+            "goog-ops-agent-policy": "v2-template-1-7-0",
+        },
+        network_tags=("customer-innodata",),
+        service_account_email="sa@p.iam.gserviceaccount.com",
+        service_account_scopes=("logging.write",),
+        metadata_items={},
+        nix_bridge_store_path=stale_store,
+    )
+    skew_metrics = {
+        "avi-bot": VmMetricsSnapshot(
+            instance_name="avi-bot",
+            cpu_utilization_pct=15.0,
+            memory_used_pct=30.0,
+            disk_used_pct=25.0,
+            uptime_seconds=1000.0,
+            api_request_count=10,
+            ops_agent_heartbeat=True,
+        ),
+        "bijal-bot": VmMetricsSnapshot(
+            instance_name="bijal-bot",
+            cpu_utilization_pct=15.0,
+            memory_used_pct=30.0,
+            disk_used_pct=25.0,
+            uptime_seconds=1000.0,
+            api_request_count=10,
+            ops_agent_heartbeat=True,
+        ),
+    }
+    aligned_res = audit_instance_compliance(
+        aligned_vm,
+        skew_metrics["avi-bot"],
+        expected_bridge_store_path=expected_store,
+    )
+    assert aligned_res.compliance_score == 100.0
+    assert aligned_res.dov_bear_alarm_level == 0
+    assert aligned_res.findings == ()
+
+    skew_report = audit_fleet_compliance(
+        [aligned_vm, stale_vm],
+        skew_metrics,
+        expected_bridge_store_path=expected_store,
+    )
+    skew_by_name = {r.instance_name: r for r in skew_report.vm_results}
+    assert skew_by_name["avi-bot"].dov_bear_alarm_level == 0
+    stale_res = skew_by_name["bijal-bot"]
+    assert stale_res.dov_bear_alarm_level == 2
+    assert len(stale_res.findings) == 1
+    drift_finding = stale_res.findings[0]
+    assert drift_finding.check_id == "NIX_STORE_GENERATION_DRIFT"
+    assert drift_finding.rule_id == "NIX_STORE_GENERATION_DRIFT"
+    assert drift_finding.pillar == "nix_sd_switch_and_process_supervision"
+    assert drift_finding.severity == "WARNING"
+    assert drift_finding.bear_alarm_level == 2
+    assert drift_finding.description == (
+        f"VM 'bijal-bot' is running stale Nix bridge store path "
+        f"'{stale_store}' (expected '{expected_store}')."
+    )
+    assert drift_finding.remediation_command == (
+        "artbot-gcp --project photography-otel-sandbox deploy-fleet --bot bijal-bot"
     )
 
     # 3. Empty fleet report (100% compliant, zero alerts, zero remediation commands)

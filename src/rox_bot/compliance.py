@@ -66,6 +66,17 @@ class ComplianceFinding:
     severity: str
     message: str
     remediation_command: str
+    bear_alarm_level: int = 2
+
+    @property
+    def rule_id(self) -> str:
+        """Alias for `check_id`."""
+        return self.check_id
+
+    @property
+    def description(self) -> str:
+        """Alias for `message`."""
+        return self.message
 
 
 @dataclass(frozen=True)
@@ -381,11 +392,12 @@ def _check_saturation_and_logs(
 def _check_nix_sd_switch_and_process_supervision(
     instance: GceInstance,
     project_id: str,
+    expected_bridge_store_path: str = "",
 ) -> list[ComplianceFinding]:
     """
     Pillar 6 (`nix_sd_switch_and_process_supervision`): Verify that a VM in
-    `FLEET_NODES_REGISTRY` (or any bot VM) has a verified `sd-switch` bridge unit
-    and Foundry `ProcessSupervisor` state.
+    `FLEET_NODES_REGISTRY` (or any bot VM) has a verified `sd-switch` bridge unit,
+    Foundry `ProcessSupervisor` state, and expected `/nix/store` bridge binary generation.
     """
     findings: list[ComplianceFinding] = []
     registry_spec = FLEET_NODES_REGISTRY.get(instance.name)
@@ -410,6 +422,26 @@ def _check_nix_sd_switch_and_process_supervision(
                 remediation_command=(
                     f"artbot-gcp --project {project_id} deploy-fleet --bot {instance.name}"
                 ),
+            )
+        )
+    if (
+        expected_bridge_store_path
+        and instance.nix_bridge_store_path
+        and instance.nix_bridge_store_path != expected_bridge_store_path
+    ):
+        findings.append(
+            ComplianceFinding(
+                check_id="NIX_STORE_GENERATION_DRIFT",
+                pillar="nix_sd_switch_and_process_supervision",
+                severity="WARNING",
+                message=(
+                    f"VM '{instance.name}' is running stale Nix bridge store path "
+                    f"'{instance.nix_bridge_store_path}' (expected '{expected_bridge_store_path}')."
+                ),
+                remediation_command=(
+                    f"artbot-gcp --project {project_id} deploy-fleet --bot {instance.name}"
+                ),
+                bear_alarm_level=2,
             )
         )
     return findings
@@ -441,7 +473,7 @@ def _compute_dov_bear_alarm(
         level = 4
     elif len(findings) >= 3 or passed_count <= 3:
         level = 3
-    elif "HIGH" in severities:
+    elif "HIGH" in severities or "NIX_STORE_GENERATION_DRIFT" in check_ids:
         level = 2
     else:
         level = 1
@@ -456,6 +488,51 @@ def _compute_dov_bear_alarm(
     )
 
 
+def audit_instance_compliance(
+    instance: GceInstance,
+    metric: VmMetricsSnapshot | None = None,
+    *,
+    bot_to_vms: Mapping[str, list[str]] | None = None,
+    logs: Sequence[LogEntryRecord] = (),
+    os_report: OsConfigReport | None = None,
+    project_id: str = DEFAULT_GCP_PROJECT,
+    expected_bridge_store_path: str = "",
+) -> VmComplianceResult:
+    """Evaluate a single Compute Engine VM against Rox's 6 compliance pillars."""
+    active_bot_to_vms: Mapping[str, list[str]] = bot_to_vms or {
+        instance.labels.get("bot", "").strip(): [instance.name]
+    }
+    p1 = _check_vm_isolation(instance, active_bot_to_vms, project_id)
+    p2 = _check_gce_labels(instance, project_id)
+    p3 = _check_network_tags(instance, project_id)
+    p4 = _check_telemetry_and_osconfig(instance, metric, os_report, project_id)
+    p5 = _check_saturation_and_logs(instance, metric, logs, project_id)
+    p6 = _check_nix_sd_switch_and_process_supervision(
+        instance, project_id, expected_bridge_store_path=expected_bridge_store_path
+    )
+
+    pillar_groups = [p1, p2, p3, p4, p5, p6]
+    passed_pillars = [PILLAR_NAMES[idx] for idx, grp in enumerate(pillar_groups) if not grp]
+    vm_findings = [f for grp in pillar_groups for f in grp]
+    score = round((len(passed_pillars) / float(len(PILLAR_NAMES))) * 100.0, 2)
+    vm_remediations = list(dict.fromkeys(f.remediation_command for f in vm_findings))
+
+    bear_level, bear_note = _compute_dov_bear_alarm(instance.name, len(passed_pillars), vm_findings)
+
+    return VmComplianceResult(
+        instance_name=instance.name,
+        zone=instance.zone,
+        customer=instance.labels.get(CUSTOMER_LABEL_KEY, "unassigned"),
+        bot=instance.labels.get("bot", "unassigned"),
+        compliance_score=score,
+        passed_pillars=tuple(passed_pillars),
+        findings=tuple(vm_findings),
+        remediation_commands=tuple(vm_remediations),
+        dov_bear_alarm_level=bear_level,
+        dov_coordination_note=bear_note,
+    )
+
+
 def audit_fleet_compliance(
     instances: Sequence[GceInstance],
     metrics: Mapping[str, VmMetricsSnapshot],
@@ -463,6 +540,7 @@ def audit_fleet_compliance(
     logs: Sequence[LogEntryRecord] = (),
     os_reports: Mapping[str, OsConfigReport] | None = None,
     project_id: str = DEFAULT_GCP_PROJECT,
+    expected_bridge_store_path: str = "",
 ) -> FleetAuditReport:
     """
     Evaluate every Compute Engine VM in `instances` against Rox's 6 GCP Fleet Hygiene
@@ -484,47 +562,18 @@ def audit_fleet_compliance(
     dov_alerts: list[str] = []
 
     for inst in sorted(instances, key=lambda i: i.name):
-        p1 = _check_vm_isolation(inst, bot_to_vms, project_id)
-        p2 = _check_gce_labels(inst, project_id)
-        p3 = _check_network_tags(inst, project_id)
-        p4 = _check_telemetry_and_osconfig(
+        res = audit_instance_compliance(
             inst,
             metrics.get(inst.name),
-            active_os_reports.get(inst.name),
-            project_id,
+            bot_to_vms=bot_to_vms,
+            logs=logs_by_vm.get(inst.name, []),
+            os_report=active_os_reports.get(inst.name),
+            project_id=project_id,
+            expected_bridge_store_path=expected_bridge_store_path,
         )
-        p5 = _check_saturation_and_logs(
-            inst,
-            metrics.get(inst.name),
-            logs_by_vm.get(inst.name, []),
-            project_id,
-        )
-        p6 = _check_nix_sd_switch_and_process_supervision(inst, project_id)
-
-        pillar_groups = [p1, p2, p3, p4, p5, p6]
-        passed_pillars = [PILLAR_NAMES[idx] for idx, grp in enumerate(pillar_groups) if not grp]
-        vm_findings = [f for grp in pillar_groups for f in grp]
-        score = round((len(passed_pillars) / float(len(PILLAR_NAMES))) * 100.0, 2)
-        vm_remediations = list(dict.fromkeys(f.remediation_command for f in vm_findings))
-
-        bear_level, bear_note = _compute_dov_bear_alarm(inst.name, len(passed_pillars), vm_findings)
-        if bear_level > 0:
-            dov_alerts.append(bear_note)
-
-        vm_results.append(
-            VmComplianceResult(
-                instance_name=inst.name,
-                zone=inst.zone,
-                customer=inst.labels.get(CUSTOMER_LABEL_KEY, "unassigned"),
-                bot=inst.labels.get("bot", "unassigned"),
-                compliance_score=score,
-                passed_pillars=tuple(passed_pillars),
-                findings=tuple(vm_findings),
-                remediation_commands=tuple(vm_remediations),
-                dov_bear_alarm_level=bear_level,
-                dov_coordination_note=bear_note,
-            )
-        )
+        if res.dov_bear_alarm_level > 0:
+            dov_alerts.append(res.dov_coordination_note)
+        vm_results.append(res)
 
     all_remediations = list(
         dict.fromkeys(cmd for r in vm_results for cmd in r.remediation_commands)
