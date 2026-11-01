@@ -45,14 +45,15 @@ def test_package_exports_and_persona_and_upstream_pin(tmp_path: Path) -> None:
     assert rox_bot.__version__ == "0.1.0"
     assert GceInstanceInfo is GceInstance
     assert "nix_sd_switch_and_process_supervision" in PILLAR_NAMES
-    assert len(PILLAR_NAMES) == 6
+    assert "cross_customer_isolation" in PILLAR_NAMES
+    assert len(PILLAR_NAMES) == 7
     root = default_repo_root()
     assert default_upstream_pin_path().name == "UPSTREAM_ARTBOT.json"
     assert default_persona_path().name == "PERSONA.md"
 
     pin = load_upstream_artbot_pin()
     assert pin["upstream_tag"] == "v0.2.0-artbot"
-    assert pin["upstream_commit"] == "6c63513a9f92887aa13ddd7f562e82eb32e87873"
+    assert pin["upstream_commit"] == "b3fbc3b87fd7b1e561f1d78f179ba31dcf64cb81"
     for sym in (
         "CUSTOMER_LABEL_KEY",
         "FLEET_NODES_REGISTRY",
@@ -450,7 +451,7 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
     assert handoff_json["payload"]["target_agent"] == "dov-bot"
     by_name = {r.instance_name: r for r in report.vm_results}
     assert by_name["artbot-01"].dov_bear_alarm_level == 0
-    assert len(by_name["artbot-01"].passed_pillars) == 6
+    assert len(by_name["artbot-01"].passed_pillars) == 7
     assert by_name["legacy-container-pod-vm"].dov_bear_alarm_level == 5
 
     # Verify Markdown and dict serialization
@@ -718,6 +719,7 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
     assert len(stale_res.findings) == 1
     drift_finding = stale_res.findings[0]
     assert drift_finding.check_id == "NIX_STORE_GENERATION_DRIFT"
+    assert drift_finding.code == "NIX_STORE_GENERATION_DRIFT"
     assert drift_finding.rule_id == "NIX_STORE_GENERATION_DRIFT"
     assert drift_finding.pillar == "nix_sd_switch_and_process_supervision"
     assert drift_finding.severity == "WARNING"
@@ -728,6 +730,79 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
     )
     assert drift_finding.remediation_command == (
         "artbot-gcp --project photography-otel-sandbox deploy-fleet --bot bijal-bot"
+    )
+
+    # 2c. Test SHARED_SKILLS_DRIFT and CROSS_CUSTOMER_ISOLATION_BREACH
+    skills_drift_vm = GceInstance(
+        name="david-bot",
+        zone="me-west1-c",
+        status="RUNNING",
+        machine_type="e2-standard-4",
+        boot_disk_image="debian-12",
+        internal_ip="10.0.0.13",
+        external_ip="",
+        labels={
+            "customer": "innodata",
+            "bot": "david-bot",
+            "contact": "rox",
+            "goog-ops-agent-policy": "v2-template-1-7-0",
+        },
+        network_tags=("customer-innodata",),
+        service_account_email="sa@p.iam.gserviceaccount.com",
+        service_account_scopes=("logging.write",),
+        metadata_items={},
+        shared_skills_synced=False,
+    )
+    skills_res = audit_instance_compliance(
+        skills_drift_vm,
+        skew_metrics["avi-bot"],
+    )
+    assert skills_res.dov_bear_alarm_level == 2
+    assert len(skills_res.findings) == 1
+    assert skills_res.findings[0].code == "SHARED_SKILLS_DRIFT"
+    assert skills_res.findings[0].pillar == "nix_sd_switch_and_process_supervision"
+    assert skills_res.findings[0].severity == "WARNING"
+    assert skills_res.findings[0].bear_alarm_level == 2
+    assert (
+        skills_res.findings[0].remediation_command
+        == "artbot-gcp --project photography-otel-sandbox deploy-fleet --bot david-bot"
+    )
+
+    breach_vm = GceInstance(
+        name="michael-bot",
+        zone="me-west1-c",
+        status="RUNNING",
+        machine_type="e2-standard-4",
+        boot_disk_image="debian-12",
+        internal_ip="10.0.0.14",
+        external_ip="",
+        labels={
+            "customer": "sjjcc",
+            "bot": "michael-bot",
+            "contact": "rox",
+            "goog-ops-agent-policy": "v2-template-1-7-0",
+        },
+        network_tags=("customer-sjjcc",),
+        service_account_email="sa@p.iam.gserviceaccount.com",
+        service_account_scopes=("logging.write",),
+        metadata_items={},
+        cross_tenant_leak_detected=True,
+        cross_tenant_leak_details="",
+    )
+    breach_res = audit_instance_compliance(
+        breach_vm,
+        skew_metrics["avi-bot"],
+    )
+    assert breach_res.dov_bear_alarm_level == 5
+    assert len(breach_res.findings) == 1
+    assert breach_res.findings[0].code == "CROSS_CUSTOMER_ISOLATION_BREACH"
+    assert breach_res.findings[0].pillar == "cross_customer_isolation"
+    assert breach_res.findings[0].severity == "CRITICAL"
+    assert breach_res.findings[0].bear_alarm_level == 5
+    assert breach_res.findings[0].message == "Cross-customer credential or tenant leakage detected"
+    assert (
+        breach_res.findings[0].remediation_command
+        == "artbot-gcp --project photography-otel-sandbox deploy-fleet --bot michael-bot"
     )
 
     # 3. Empty fleet report (100% compliant, zero alerts, zero remediation commands)

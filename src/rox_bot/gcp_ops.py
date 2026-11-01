@@ -94,6 +94,9 @@ class GceInstance:
     sd_switch_healthy: bool = True
     process_supervisor_ok: bool = True
     nix_bridge_store_path: str = ""
+    shared_skills_synced: bool = True
+    cross_tenant_leak_detected: bool = False
+    cross_tenant_leak_details: str = ""
 
 
 GceInstanceInfo = GceInstance
@@ -297,6 +300,17 @@ def parse_gce_instance(raw: Mapping[str, Any], fallback_zone: str = "us-central1
     nix_bridge_store_path = str(
         raw.get("nix_bridge_store_path") or metadata_items.get("nix-bridge-store-path") or ""
     ).strip()
+    shared_skills_synced = bool(raw.get("shared_skills_synced", True)) and (
+        metadata_items.get("shared-skills-synced", "true").strip().lower() != "false"
+    )
+    cross_tenant_leak_detected = bool(raw.get("cross_tenant_leak_detected", False)) or (
+        metadata_items.get("cross-tenant-leak-detected", "false").strip().lower() == "true"
+    )
+    cross_tenant_leak_details = str(
+        raw.get("cross_tenant_leak_details")
+        or metadata_items.get("cross-tenant-leak-details")
+        or ""
+    ).strip()
 
     return GceInstance(
         name=name,
@@ -314,6 +328,9 @@ def parse_gce_instance(raw: Mapping[str, Any], fallback_zone: str = "us-central1
         sd_switch_healthy=sd_switch_healthy,
         process_supervisor_ok=process_supervisor_ok,
         nix_bridge_store_path=nix_bridge_store_path,
+        shared_skills_synced=shared_skills_synced,
+        cross_tenant_leak_detected=cross_tenant_leak_detected,
+        cross_tenant_leak_details=cross_tenant_leak_details,
     )
 
 

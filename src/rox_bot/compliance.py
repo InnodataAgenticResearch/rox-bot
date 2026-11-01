@@ -54,6 +54,7 @@ PILLAR_NAMES: tuple[str, ...] = (
     "4. Ops Agent & Telemetry Heartbeat",
     "5. Resource Saturation & Log Hygiene",
     "nix_sd_switch_and_process_supervision",
+    "cross_customer_isolation",
 )
 
 
@@ -67,6 +68,11 @@ class ComplianceFinding:
     message: str
     remediation_command: str
     bear_alarm_level: int = 2
+
+    @property
+    def code(self) -> str:
+        """Alias for `check_id`."""
+        return self.check_id
 
     @property
     def rule_id(self) -> str:
@@ -391,13 +397,15 @@ def _check_saturation_and_logs(
 
 def _check_nix_sd_switch_and_process_supervision(
     instance: GceInstance,
-    project_id: str,
     expected_bridge_store_path: str = "",
+    *,
+    project_id: str = DEFAULT_GCP_PROJECT,
 ) -> list[ComplianceFinding]:
     """
     Pillar 6 (`nix_sd_switch_and_process_supervision`): Verify that a VM in
     `FLEET_NODES_REGISTRY` (or any bot VM) has a verified `sd-switch` bridge unit,
-    Foundry `ProcessSupervisor` state, and expected `/nix/store` bridge binary generation.
+    Foundry `ProcessSupervisor` state, expected `/nix/store` bridge binary generation,
+    and synchronized `~/.hermes/shared-skills`.
     """
     findings: list[ComplianceFinding] = []
     registry_spec = FLEET_NODES_REGISTRY.get(instance.name)
@@ -444,6 +452,51 @@ def _check_nix_sd_switch_and_process_supervision(
                 bear_alarm_level=2,
             )
         )
+    if not instance.shared_skills_synced:
+        findings.append(
+            ComplianceFinding(
+                check_id="SHARED_SKILLS_DRIFT",
+                pillar="nix_sd_switch_and_process_supervision",
+                severity="WARNING",
+                message=(
+                    f"VM '{instance.name}' is missing synchronized ~/.hermes/shared-skills "
+                    "(shared_skills_synced=False)."
+                ),
+                remediation_command=(
+                    f"artbot-gcp --project {project_id} deploy-fleet --bot {instance.name}"
+                ),
+                bear_alarm_level=2,
+            )
+        )
+    return findings
+
+
+def _check_cross_customer_isolation(
+    instance: GceInstance,
+    *,
+    project_id: str = DEFAULT_GCP_PROJECT,
+) -> list[ComplianceFinding]:
+    """
+    Pillar 7 (`cross_customer_isolation`): Verify zero cross-customer credential,
+    `.env`, `qdrant.json`, or skill leakage across tenant boundaries.
+    """
+    findings: list[ComplianceFinding] = []
+    if instance.cross_tenant_leak_detected:
+        findings.append(
+            ComplianceFinding(
+                check_id="CROSS_CUSTOMER_ISOLATION_BREACH",
+                pillar="cross_customer_isolation",
+                severity="CRITICAL",
+                message=(
+                    instance.cross_tenant_leak_details
+                    or "Cross-customer credential or tenant leakage detected"
+                ),
+                remediation_command=(
+                    f"artbot-gcp --project {project_id} deploy-fleet --bot {instance.name}"
+                ),
+                bear_alarm_level=5,
+            )
+        )
     return findings
 
 
@@ -467,13 +520,19 @@ def _compute_dov_bear_alarm(
     severities = {f.severity for f in findings}
     check_ids = {f.check_id for f in findings}
 
-    if "VM_ISOLATION_SHARED_KERNEL" in check_ids and len(findings) >= 3:
+    if "CROSS_CUSTOMER_ISOLATION_BREACH" in check_ids or (
+        "VM_ISOLATION_SHARED_KERNEL" in check_ids and len(findings) >= 3
+    ):
         level = 5
     elif "CRITICAL" in severities:
         level = 4
-    elif len(findings) >= 3 or passed_count <= 3:
+    elif len(findings) >= 3:
         level = 3
-    elif "HIGH" in severities or "NIX_STORE_GENERATION_DRIFT" in check_ids:
+    elif (
+        "HIGH" in severities
+        or "NIX_STORE_GENERATION_DRIFT" in check_ids
+        or "SHARED_SKILLS_DRIFT" in check_ids
+    ):
         level = 2
     else:
         level = 1
@@ -498,7 +557,7 @@ def audit_instance_compliance(
     project_id: str = DEFAULT_GCP_PROJECT,
     expected_bridge_store_path: str = "",
 ) -> VmComplianceResult:
-    """Evaluate a single Compute Engine VM against Rox's 6 compliance pillars."""
+    """Evaluate a single Compute Engine VM against Rox's 7 compliance pillars."""
     active_bot_to_vms: Mapping[str, list[str]] = bot_to_vms or {
         instance.labels.get("bot", "").strip(): [instance.name]
     }
@@ -508,10 +567,11 @@ def audit_instance_compliance(
     p4 = _check_telemetry_and_osconfig(instance, metric, os_report, project_id)
     p5 = _check_saturation_and_logs(instance, metric, logs, project_id)
     p6 = _check_nix_sd_switch_and_process_supervision(
-        instance, project_id, expected_bridge_store_path=expected_bridge_store_path
+        instance, expected_bridge_store_path, project_id=project_id
     )
+    p7 = _check_cross_customer_isolation(instance, project_id=project_id)
 
-    pillar_groups = [p1, p2, p3, p4, p5, p6]
+    pillar_groups = [p1, p2, p3, p4, p5, p6, p7]
     passed_pillars = [PILLAR_NAMES[idx] for idx, grp in enumerate(pillar_groups) if not grp]
     vm_findings = [f for grp in pillar_groups for f in grp]
     score = round((len(passed_pillars) / float(len(PILLAR_NAMES))) * 100.0, 2)

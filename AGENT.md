@@ -7,7 +7,7 @@ This repository (`https://github.com/InnodataAgenticResearch/rox-bot`) implement
 Before making any code, configuration, or policy change in this repository, read:
 
 1. `STANDARDS.md` — Binding engineering standards (100% line and branch coverage, strict typing, `shac` policy enforcement, zero `unittest.mock`, deterministic tests run twice in random order).
-2. `UPSTREAM_ARTBOT.json` — Pins the upstream `InnodataAgenticResearch/artbot` release tag (`v0.2.0-artbot`), commit SHA (`6c63513a9f92887aa13ddd7f562e82eb32e87873`), and `public_api_allowlist`.
+2. `UPSTREAM_ARTBOT.json` — Pins the upstream `InnodataAgenticResearch/artbot` release tag (`v0.2.0-artbot`), commit SHA (`b3fbc3b87fd7b1e561f1d78f179ba31dcf64cb81`), and `public_api_allowlist`.
 3. `config/PERSONA.md` — Rox's persona (**"CONTAINERS AREN'T SECURE IN PRODUCTION"**), zero-trust VM isolation rules (`1 bot = 1 VM`), GCP Fleet Hygiene & Security Standards, and cross-bot coordination protocol with **Dov (`@dov-bot`, L6 TPM Bear)**.
 4. `checks/api_contract.star` & `checks/policy.star` — Automated Starlark checks verifying upstream ArtBOT contract locking, immutable systemd bridge units, secret prevention, and documentation completeness.
 
