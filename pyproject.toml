@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rox-bot"
+version = "0.1.0"
+description = "Rox-Bot (Custom ArtBOT): GCP Ops & Security Lead agent for photography-otel-sandbox fleet hygiene, monitoring, and zero-trust VM isolation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+rox-bot = "rox_bot.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+files = ["src", "tests"]
+explicit_package_bases = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-p randomly --cov=rox_bot --cov-branch --cov-report=term-missing --cov-fail-under=100"
+
+[tool.coverage.run]
+branch = true
+source = ["rox_bot"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
