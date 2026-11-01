@@ -14,6 +14,7 @@ import pytest
 import rox_bot
 from rox_bot.cli import main
 from rox_bot.compliance import (
+    PILLAR_NAMES,
     audit_fleet_compliance,
     fleet_audit_to_dict,
     render_fleet_audit_markdown,
@@ -22,6 +23,7 @@ from rox_bot.compliance import (
 from rox_bot.gcp_ops import (
     DEFAULT_GCP_PROJECT,
     GceInstance,
+    GceInstanceInfo,
     GcpOpsClient,
     HttpResponse,
     LogEntryRecord,
@@ -40,13 +42,25 @@ from tests.fakes import FakeHttpTransport
 
 def test_package_exports_and_persona_and_upstream_pin(tmp_path: Path) -> None:
     assert rox_bot.__version__ == "0.1.0"
+    assert GceInstanceInfo is GceInstance
+    assert "nix_sd_switch_and_process_supervision" in PILLAR_NAMES
+    assert len(PILLAR_NAMES) == 6
     root = default_repo_root()
     assert default_upstream_pin_path().name == "UPSTREAM_ARTBOT.json"
     assert default_persona_path().name == "PERSONA.md"
 
     pin = load_upstream_artbot_pin()
-    assert pin["upstream_tag"] == "v0.1.0-artbot"
-    assert pin["upstream_commit"] == "e28cf26c2b71e4f081ce17f3815fae31375a98d3"
+    assert pin["upstream_tag"] == "v0.2.0-artbot"
+    assert pin["upstream_commit"] == "3cfa4e8d2ed6c30c51f03c7a92b58df0a694c781"
+    for sym in (
+        "CUSTOMER_LABEL_KEY",
+        "FLEET_NODES_REGISTRY",
+        "PEER_AGENT_ROSTER",
+        "PeerBlackboardHandoff",
+        "build_peer_blackboard_block",
+        "normalize_gcp_label_value",
+    ):
+        assert sym in pin["public_api_allowlist"]
 
     persona = load_persona_metadata()
     assert persona.handle == "@rox-bot"
@@ -79,10 +93,6 @@ def test_http_response_and_fake_transport_defaults() -> None:
     resp = HttpResponse(status_code=200, body='{"ok": true}')
     assert resp.json() == {"ok": True}
 
-    bad_resp = HttpResponse(status_code=200, body="[1, 2]")
-    with pytest.raises(ValueError, match="Expected JSON object"):
-        bad_resp.json()
-
     fake = FakeHttpTransport()
     # Default fallback when queue is empty
     default_get = fake.get("https://example.com", headers={}, timeout=5.0)
@@ -92,6 +102,12 @@ def test_http_response_and_fake_transport_defaults() -> None:
     default_post = fake.post_json("https://example.com", payload={"a": 1}, headers={}, timeout=5.0)
     assert default_post.status_code == 200
     assert default_post.json() == {}
+
+    default_patch = fake.patch_json(
+        "https://example.com", payload={"a": 1}, headers={}, timeout=5.0
+    )
+    assert default_patch.status_code == 200
+    assert default_patch.json() == {}
 
 
 def test_parse_gce_instance_variations() -> None:
@@ -124,6 +140,8 @@ def test_parse_gce_instance_variations() -> None:
     assert minimal.service_account_email == ""
     assert minimal.service_account_scopes == ()
     assert minimal.metadata_items == {}
+    assert minimal.sd_switch_healthy is True
+    assert minimal.process_supervisor_ok is True
 
     # Instance with non-mapping disk/nic and non-list accessConfigs/tags/scopes/metadata
     edge = parse_gce_instance(
@@ -134,12 +152,16 @@ def test_parse_gce_instance_variations() -> None:
             "tags": {"items": "not-a-list"},
             "serviceAccounts": [{"email": "sa@example.com", "scopes": "not-a-list"}],
             "metadata": {"items": ["not-a-mapping", {"key": "", "value": "skip"}]},
+            "sd_switch_healthy": False,
+            "process_supervisor_ok": False,
         }
     )
     assert edge.boot_disk_image == "debian-12"
     assert edge.service_account_email == "sa@example.com"
     assert edge.service_account_scopes == ()
     assert edge.metadata_items == {}
+    assert edge.sd_switch_healthy is False
+    assert edge.process_supervisor_ok is False
 
     # Instance with empty disks/licenses, non-list metadata.items, and accessConfigs non-mapping
     edge2 = parse_gce_instance(
@@ -420,20 +442,29 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
     assert report.total_vm_count == 4
     assert report.compliant_vm_count == 3
     assert report.max_dov_bear_alarm == 5
+    assert "peer.blackboard.v1" in report.dov_handoff_message
+    handoff_json = json.loads(report.dov_handoff_message)
+    assert handoff_json["owner_agent"] == "rox-bot"
+    assert handoff_json["payload"]["source_agent"] == "rox-bot"
+    assert handoff_json["payload"]["target_agent"] == "dov-bot"
     by_name = {r.instance_name: r for r in report.vm_results}
     assert by_name["artbot-01"].dov_bear_alarm_level == 0
+    assert len(by_name["artbot-01"].passed_pillars) == 6
     assert by_name["legacy-container-pod-vm"].dov_bear_alarm_level == 5
 
     # Verify Markdown and dict serialization
     audit_md = render_fleet_audit_markdown(report)
     assert "CONTAINERS AREN'T SECURE IN PRODUCTION" in audit_md
     assert "legacy-container-pod-vm" in audit_md
+    assert "peer.blackboard.v1" in audit_md
     rem_md = render_remediation_plan_markdown(report)
     assert "artbot-gcp provision" in rem_md
     report_dict = fleet_audit_to_dict(report)
     assert report_dict["max_dov_bear_alarm"] == 5
+    assert "peer.blackboard.v1" in report_dict["dov_handoff_message"]
 
-    # 2. Test Bear Alarm levels 1, 2, 3, 4 and duplicate bot / policy drift / stopped VM branches
+    # 2. Test Bear Alarm levels 1, 2, 3, 4, Pillar 6 drift on FLEET_NODES_REGISTRY node,
+    # and duplicate bot / policy drift / stopped VM branches
     custom_instances = [
         # Bear Alarm 1 (single MEDIUM finding: goog-ops-agent-policy drift)
         GceInstance(
@@ -515,6 +546,28 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
             service_account_scopes=("logging.write",),
             metadata_items={},
         ),
+        # Pillar 6 failure on FLEET_NODES_REGISTRY node `rox-ops-bot`
+        GceInstance(
+            name="rox-ops-bot",
+            zone="me-west1-c",
+            status="RUNNING",
+            machine_type="e2-standard-4",
+            boot_disk_image="debian-12",
+            internal_ip="10.0.0.5",
+            external_ip="",
+            labels={
+                "customer": "innodata",
+                "bot": "rox-ops-bot",
+                "contact": "rox",
+                "goog-ops-agent-policy": "v2-template-1-7-0",
+            },
+            network_tags=("customer-innodata",),
+            service_account_email="sa@p.iam.gserviceaccount.com",
+            service_account_scopes=("logging.write",),
+            metadata_items={},
+            sd_switch_healthy=False,
+            process_supervisor_ok=False,
+        ),
     ]
     custom_metrics = {
         "vm-bear-1": VmMetricsSnapshot(
@@ -544,6 +597,15 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
             api_request_count=10,
             ops_agent_heartbeat=True,
         ),
+        "rox-ops-bot": VmMetricsSnapshot(
+            instance_name="rox-ops-bot",
+            cpu_utilization_pct=15.0,
+            memory_used_pct=30.0,
+            disk_used_pct=25.0,
+            uptime_seconds=1000.0,
+            api_request_count=10,
+            ops_agent_heartbeat=True,
+        ),
     }
     # Include a non-CRITICAL log entry on vm-bear-3 and duplicate remediation check
     custom_logs = [
@@ -566,11 +628,16 @@ def test_compliance_audit_all_branches_and_bear_alarm_levels() -> None:
     assert c_by_name["vm-bear-2"].dov_bear_alarm_level == 2
     assert c_by_name["vm-bear-3"].dov_bear_alarm_level == 3
     assert c_by_name["vm-bear-4"].dov_bear_alarm_level == 4
+    assert c_by_name["rox-ops-bot"].dov_bear_alarm_level == 2
+    assert c_by_name["rox-ops-bot"].remediation_commands == (
+        "artbot-gcp --project photography-otel-sandbox deploy-fleet --bot rox-ops-bot",
+    )
 
     # 3. Empty fleet report (100% compliant, zero alerts, zero remediation commands)
     empty_report = audit_fleet_compliance([], {})
     assert empty_report.fleet_score == 100.0
     assert empty_report.max_dov_bear_alarm == 0
+    assert empty_report.dov_handoff_message == ""
     assert "Entire fleet is 100% compliant" in render_fleet_audit_markdown(empty_report)
     assert "Zero remediation actions required" in render_remediation_plan_markdown(empty_report)
 
@@ -658,11 +725,11 @@ def test_load_seed_fleet_from_file_and_cli_commands(tmp_path: Path) -> None:
     # CLI: upstream-status (text and JSON)
     out = io.StringIO()
     assert main(["upstream-status"], stdout=out) == 0
-    assert "v0.1.0-artbot" in out.getvalue()
+    assert "v0.2.0-artbot" in out.getvalue()
 
     out = io.StringIO()
     assert main(["upstream-status", "--json"], stdout=out) == 0
-    assert json.loads(out.getvalue())["upstream_tag"] == "v0.1.0-artbot"
+    assert json.loads(out.getvalue())["upstream_tag"] == "v0.2.0-artbot"
 
     # CLI: persona-info (text and JSON)
     out = io.StringIO()

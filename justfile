@@ -44,8 +44,8 @@ test:
 
 # Run GCP fleet compliance audit (seeded offline or live via GCP token)
 fleet-audit:
-	PYTHONPATH=src python3 -m rox_bot.cli fleet-audit
+	PYTHONPATH=src:../artbot/src python3 -m rox_bot.cli fleet-audit
 
 # Verify upstream ArtBOT tag and commit pin
 upstream-status:
-	PYTHONPATH=src python3 -m rox_bot.cli upstream-status
+	PYTHONPATH=src:../artbot/src python3 -m rox_bot.cli upstream-status

@@ -11,14 +11,14 @@ Wraps:
 from __future__ import annotations
 
 import json
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
+
+from artbot import CUSTOMER_LABEL_KEY, HttpResponse, HttpTransport, UrllibHttpTransport
 
 DEFAULT_GCP_PROJECT = "photography-otel-sandbox"
 DEFAULT_OPS_AGENT_POLICY = "v2-template-1-7-0"
@@ -35,93 +35,44 @@ METRIC_DISK_PERCENT = "agent.googleapis.com/disk/percent_used"
 METRIC_API_REQUEST_COUNT = "serviceruntime.googleapis.com/api/request_count"
 
 REQUIRED_VM_LABELS: tuple[str, ...] = (
-    "customer",
+    CUSTOMER_LABEL_KEY,
     "bot",
     "contact",
     "goog-ops-agent-policy",
 )
 
-
-@dataclass(frozen=True)
-class HttpResponse:
-    """Minimal HTTP response object for deterministic testing and transports."""
-
-    status_code: int
-    body: str
-
-    def json(self) -> dict[str, Any]:
-        """Parse JSON response body into a dictionary."""
-        parsed = json.loads(self.body)
-        if not isinstance(parsed, dict):
-            raise ValueError("Expected JSON object in HttpResponse body")
-        return parsed
-
-
-class HttpTransport(Protocol):
-    """Protocol for injectable HTTP transports."""
-
-    def get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str],
-        timeout: float,
-    ) -> HttpResponse: ...  # pragma: no cover - protocol stub
-
-    def post_json(
-        self,
-        url: str,
-        *,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        timeout: float,
-    ) -> HttpResponse: ...  # pragma: no cover - protocol stub
-
-
-class UrllibHttpTransport:
-    """Standard-library urllib transport implementing `HttpTransport`."""
-
-    def get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str],
-        timeout: float,
-    ) -> HttpResponse:  # pragma: no cover - network transport boundary
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return HttpResponse(
-                    status_code=int(resp.status),
-                    body=resp.read().decode("utf-8", errors="replace"),
-                )
-        except urllib.error.HTTPError as exc:
-            return HttpResponse(
-                status_code=int(exc.code),
-                body=exc.read().decode("utf-8", errors="replace"),
-            )
-
-    def post_json(
-        self,
-        url: str,
-        *,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        timeout: float,
-    ) -> HttpResponse:  # pragma: no cover - network transport boundary
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return HttpResponse(
-                    status_code=int(resp.status),
-                    body=resp.read().decode("utf-8", errors="replace"),
-                )
-        except urllib.error.HTTPError as exc:
-            return HttpResponse(
-                status_code=int(exc.code),
-                body=exc.read().decode("utf-8", errors="replace"),
-            )
+__all__ = [
+    "COMPUTE_BASE_URL",
+    "DEFAULT_GCP_PROJECT",
+    "DEFAULT_OPS_AGENT_POLICY",
+    "LOGGING_BASE_URL",
+    "METRIC_API_REQUEST_COUNT",
+    "METRIC_CPU_UTILIZATION",
+    "METRIC_DISK_PERCENT",
+    "METRIC_MEMORY_PERCENT",
+    "METRIC_UPTIME",
+    "MONITORING_BASE_URL",
+    "OSCONFIG_BASE_URL",
+    "REQUIRED_VM_LABELS",
+    "GceInstance",
+    "GceInstanceInfo",
+    "GcpOpsClient",
+    "HttpResponse",
+    "HttpTransport",
+    "LogEntryRecord",
+    "OsConfigReport",
+    "RoxPersonaMetadata",
+    "UrllibHttpTransport",
+    "VmMetricsSnapshot",
+    "default_persona_path",
+    "default_repo_root",
+    "default_seed_fleet",
+    "default_upstream_pin_path",
+    "load_persona_metadata",
+    "load_seed_fleet_from_file",
+    "load_upstream_artbot_pin",
+    "parse_gce_instance",
+]
 
 
 @dataclass(frozen=True)
@@ -140,6 +91,11 @@ class GceInstance:
     service_account_email: str
     service_account_scopes: tuple[str, ...]
     metadata_items: Mapping[str, str]
+    sd_switch_healthy: bool = True
+    process_supervisor_ok: bool = True
+
+
+GceInstanceInfo = GceInstance
 
 
 @dataclass(frozen=True)
@@ -245,7 +201,7 @@ def load_persona_metadata(repo_root: Path | None = None) -> RoxPersonaMetadata:
             "Mandatory labels: customer, bot, contact, goog-ops-agent-policy=v2-template-1-7-0",
             "Network tag isolation: customer-<slug> required on every bot VM",
             "Active Cloud Monitoring & Ops Agent telemetry heartbeat within SLOs",
-            "Deterministic Nix profile alignment & @dov-bot 0-5 Bear Alarm coordination",
+            "Deterministic Nix sd-switch supervision & @dov-bot 0-5 Bear Alarm coordination",
         ),
         avatar_svg_path="assets/rox_avatar.svg",
         avatar_png_path="assets/rox_avatar.png",
@@ -331,6 +287,13 @@ def parse_gce_instance(raw: Mapping[str, Any], fallback_zone: str = "us-central1
                 if isinstance(entry, Mapping) and entry.get("key"):
                     metadata_items[str(entry["key"])] = str(entry.get("value") or "")
 
+    sd_switch_healthy = bool(raw.get("sd_switch_healthy", True)) and (
+        metadata_items.get("sd-switch-healthy", "true").strip().lower() != "false"
+    )
+    process_supervisor_ok = bool(raw.get("process_supervisor_ok", True)) and (
+        metadata_items.get("process-supervisor-ok", "true").strip().lower() != "false"
+    )
+
     return GceInstance(
         name=name,
         zone=zone,
@@ -344,6 +307,8 @@ def parse_gce_instance(raw: Mapping[str, Any], fallback_zone: str = "us-central1
         service_account_email=sa_email,
         service_account_scopes=tuple(sa_scopes),
         metadata_items=metadata_items,
+        sd_switch_healthy=sd_switch_healthy,
+        process_supervisor_ok=process_supervisor_ok,
     )
 
 
@@ -383,7 +348,7 @@ class GcpOpsClient:
         via `compute.googleapis.com/compute/v1/projects/{project}/aggregated/instances`.
         """
         url = f"{COMPUTE_BASE_URL}/projects/{self.project_id}/aggregated/instances"
-        resp = self.transport.get(url, headers=self._headers(), timeout=self.timeout)
+        resp: HttpResponse = self.transport.get(url, headers=self._headers(), timeout=self.timeout)
         if resp.status_code != 200:
             raise RuntimeError(
                 f"Compute Engine aggregated instances API failed with HTTP {resp.status_code}"
@@ -497,7 +462,6 @@ class GcpOpsClient:
         snapshots: dict[str, VmMetricsSnapshot] = {}
         for name in instance_names:
             raw_cpu = cpu_map.get(name)
-            # GCE cpu/utilization is either 0.0-1.0 fraction or 0-100 percentage
             cpu_pct: float | None = None
             if raw_cpu is not None:
                 cpu_pct = round(raw_cpu * 100.0 if raw_cpu <= 1.0 else raw_cpu, 2)

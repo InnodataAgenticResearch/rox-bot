@@ -6,11 +6,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/rox-bot
+Environment="PATH=%h/.nix-profile/bin:/nix/var/nix/profiles/default/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="ARTBOT_PROFILE_DIR=%h/.hermes/profiles/rox-bot"
 EnvironmentFile=%h/.hermes/profiles/rox-bot/.env
-Environment=PYTHONPATH=%h/rox-bot/src:%h/artbot/src
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m rox_bot.cli fleet-audit
-Restart=on-failure
+ExecStart=%h/.nix-profile/bin/artbot-bridge --daemon --host 0.0.0.0 --port 8659
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

@@ -5,6 +5,7 @@ Rox-Bot (Custom ArtBOT): GCP Ops & Security Lead package for `photography-otel-s
 from rox_bot.cli import build_parser, main
 from rox_bot.compliance import (
     FORBIDDEN_NETWORK_TAGS,
+    PILLAR_NAMES,
     SLO_MAX_CPU_PCT,
     SLO_MAX_DISK_PCT,
     SLO_MAX_MEMORY_PCT,
@@ -30,6 +31,7 @@ from rox_bot.gcp_ops import (
     OSCONFIG_BASE_URL,
     REQUIRED_VM_LABELS,
     GceInstance,
+    GceInstanceInfo,
     GcpOpsClient,
     HttpResponse,
     HttpTransport,
@@ -63,6 +65,7 @@ __all__ = [
     "METRIC_UPTIME",
     "MONITORING_BASE_URL",
     "OSCONFIG_BASE_URL",
+    "PILLAR_NAMES",
     "REQUIRED_VM_LABELS",
     "SLO_MAX_CPU_PCT",
     "SLO_MAX_DISK_PCT",
@@ -70,6 +73,7 @@ __all__ = [
     "ComplianceFinding",
     "FleetAuditReport",
     "GceInstance",
+    "GceInstanceInfo",
     "GcpOpsClient",
     "HttpResponse",
     "HttpTransport",

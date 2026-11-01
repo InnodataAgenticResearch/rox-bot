@@ -1,16 +1,17 @@
 """
 Rox's GCP Fleet Hygiene & Security Compliance Engine (`src/rox_bot/compliance.py`).
 
-Evaluates every Compute Engine VM in `photography-otel-sandbox` against Rox's 5 standards:
+Evaluates every Compute Engine VM in `photography-otel-sandbox` against Rox's 6 standards:
 1. Dedicated VM isolation (`1 bot = 1 VM`; no shared-kernel container multi-tenancy in production).
 2. Required GCE labels (`customer`, `bot`, `contact`, `goog-ops-agent-policy=v2-template-1-7-0`).
 3. Network tag hygiene (`customer-<slug>` required; no `allow-all-ingress`).
 4. Ops Agent & Cloud Monitoring telemetry heartbeat active + OS Config/Nix profile alignment.
 5. CPU (`<= 80%`), Memory (`<= 85%`), and Disk (`<= 85%`) saturation within SLO thresholds.
+6. Nix `sd-switch` & Foundry `ProcessSupervisor` (`nix_sd_switch_and_process_supervision`).
 
 Produces a `FleetAuditReport` with per-VM compliance scores (`0.0–100.0%`), remediation
-`gcloud` / `artbot-gcp` commands, and cross-bot coordination alerts for Dov (`@dov-bot`)
-mapped onto Dov's 0–5 🐻 Bear Alarm scale.
+`gcloud` / `artbot-gcp` commands, and cross-bot coordination alerts + `PeerBlackboardHandoff`
+blocks for Dov (`@dov-bot`) mapped onto Dov's 0–5 🐻 Bear Alarm scale.
 """
 
 from __future__ import annotations
@@ -18,6 +19,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from artbot import (
+    CUSTOMER_LABEL_KEY,
+    FLEET_NODES_REGISTRY,
+    PeerBlackboardHandoff,
+    build_peer_blackboard_block,
+    normalize_gcp_label_value,
+    serialize_loop_data_block,
+)
 
 from rox_bot.gcp_ops import (
     DEFAULT_GCP_PROJECT,
@@ -35,6 +45,15 @@ SLO_MAX_DISK_PCT = 85.0
 
 FORBIDDEN_NETWORK_TAGS: frozenset[str] = frozenset(
     {"allow-all-ingress", "public-ssh-world", "open-all-ports"}
+)
+
+PILLAR_NAMES: tuple[str, ...] = (
+    "1. Dedicated VM Isolation (1 Bot = 1 VM)",
+    "2. Required GCE Metadata Labels",
+    "3. Network Tag Hygiene",
+    "4. Ops Agent & Telemetry Heartbeat",
+    "5. Resource Saturation & Log Hygiene",
+    "nix_sd_switch_and_process_supervision",
 )
 
 
@@ -77,6 +96,7 @@ class FleetAuditReport:
     vm_results: tuple[VmComplianceResult, ...]
     dov_alerts: tuple[str, ...]
     all_remediation_commands: tuple[str, ...]
+    dov_handoff_message: str = ""
 
 
 def _check_vm_isolation(
@@ -143,7 +163,7 @@ def _check_gce_labels(
     policy_val = instance.labels.get("goog-ops-agent-policy", "").strip()
 
     if missing_labels:
-        customer_val = instance.labels.get("customer", "innodata") or "innodata"
+        customer_val = instance.labels.get(CUSTOMER_LABEL_KEY, "innodata") or "innodata"
         bot_val = instance.labels.get("bot", instance.name) or instance.name
         contact_val = instance.labels.get("contact", "rox") or "rox"
         findings.append(
@@ -189,7 +209,7 @@ def _check_network_tags(
 ) -> list[ComplianceFinding]:
     """Pillar 3: Network tag hygiene (`customer-<slug>` present and no forbidden wide-open tags)."""
     findings: list[ComplianceFinding] = []
-    customer_slug = (instance.labels.get("customer") or "innodata").strip().lower()
+    customer_slug = normalize_gcp_label_value(instance.labels.get(CUSTOMER_LABEL_KEY) or "innodata")
     expected_tag = f"customer-{customer_slug}"
 
     if expected_tag not in instance.network_tags:
@@ -358,6 +378,43 @@ def _check_saturation_and_logs(
     return findings
 
 
+def _check_nix_sd_switch_and_process_supervision(
+    instance: GceInstance,
+    project_id: str,
+) -> list[ComplianceFinding]:
+    """
+    Pillar 6 (`nix_sd_switch_and_process_supervision`): Verify that a VM in
+    `FLEET_NODES_REGISTRY` (or any bot VM) has a verified `sd-switch` bridge unit
+    and Foundry `ProcessSupervisor` state.
+    """
+    findings: list[ComplianceFinding] = []
+    registry_spec = FLEET_NODES_REGISTRY.get(instance.name)
+    bridge_unit = (
+        str(registry_spec.get("bridge_unit", "artbot-teams-bridge.service"))
+        if registry_spec is not None
+        else f"{instance.labels.get('bot', instance.name)}-teams-bridge.service"
+    )
+    if not instance.sd_switch_healthy or not instance.process_supervisor_ok:
+        findings.append(
+            ComplianceFinding(
+                check_id="NIX_SD_SWITCH_OR_SUPERVISOR_DRIFT",
+                pillar="nix_sd_switch_and_process_supervision",
+                severity="HIGH",
+                message=(
+                    f"VM '{instance.name}' (bridge_unit='{bridge_unit}', "
+                    f"in_fleet_registry={registry_spec is not None}) has Nix sd-switch or "
+                    f"Foundry ProcessSupervisor drift: "
+                    f"sd_switch_healthy={instance.sd_switch_healthy}, "
+                    f"process_supervisor_ok={instance.process_supervisor_ok}."
+                ),
+                remediation_command=(
+                    f"artbot-gcp --project {project_id} deploy-fleet --bot {instance.name}"
+                ),
+            )
+        )
+    return findings
+
+
 def _compute_dov_bear_alarm(
     instance_name: str,
     passed_count: int,
@@ -371,7 +428,7 @@ def _compute_dov_bear_alarm(
             0,
             (
                 f"@dov-bot [🐻 Bear Alarm 0/5 — All Clear]: VM '{instance_name}' "
-                "passed 5/5 Zero-Trust & Ops gates."
+                f"passed {len(PILLAR_NAMES)}/{len(PILLAR_NAMES)} Zero-Trust & Ops gates."
             ),
         )
 
@@ -382,7 +439,7 @@ def _compute_dov_bear_alarm(
         level = 5
     elif "CRITICAL" in severities:
         level = 4
-    elif len(findings) >= 3 or passed_count <= 2:
+    elif len(findings) >= 3 or passed_count <= 3:
         level = 3
     elif "HIGH" in severities:
         level = 2
@@ -408,7 +465,7 @@ def audit_fleet_compliance(
     project_id: str = DEFAULT_GCP_PROJECT,
 ) -> FleetAuditReport:
     """
-    Evaluate every Compute Engine VM in `instances` against Rox's 5 GCP Fleet Hygiene
+    Evaluate every Compute Engine VM in `instances` against Rox's 6 GCP Fleet Hygiene
     & Security Standards and produce a `FleetAuditReport`.
     """
     active_os_reports: Mapping[str, OsConfigReport] = {} if os_reports is None else os_reports
@@ -426,14 +483,6 @@ def audit_fleet_compliance(
     vm_results: list[VmComplianceResult] = []
     dov_alerts: list[str] = []
 
-    pillar_names = (
-        "1. Dedicated VM Isolation (1 Bot = 1 VM)",
-        "2. Required GCE Metadata Labels",
-        "3. Network Tag Hygiene",
-        "4. Ops Agent & Telemetry Heartbeat",
-        "5. Resource Saturation & Log Hygiene",
-    )
-
     for inst in sorted(instances, key=lambda i: i.name):
         p1 = _check_vm_isolation(inst, bot_to_vms, project_id)
         p2 = _check_gce_labels(inst, project_id)
@@ -450,11 +499,12 @@ def audit_fleet_compliance(
             logs_by_vm.get(inst.name, []),
             project_id,
         )
+        p6 = _check_nix_sd_switch_and_process_supervision(inst, project_id)
 
-        pillar_groups = [p1, p2, p3, p4, p5]
-        passed_pillars = [pillar_names[idx] for idx, grp in enumerate(pillar_groups) if not grp]
+        pillar_groups = [p1, p2, p3, p4, p5, p6]
+        passed_pillars = [PILLAR_NAMES[idx] for idx, grp in enumerate(pillar_groups) if not grp]
         vm_findings = [f for grp in pillar_groups for f in grp]
-        score = round((len(passed_pillars) / 5.0) * 100.0, 2)
+        score = round((len(passed_pillars) / float(len(PILLAR_NAMES))) * 100.0, 2)
         vm_remediations = list(dict.fromkeys(f.remediation_command for f in vm_findings))
 
         bear_level, bear_note = _compute_dov_bear_alarm(inst.name, len(passed_pillars), vm_findings)
@@ -465,7 +515,7 @@ def audit_fleet_compliance(
             VmComplianceResult(
                 instance_name=inst.name,
                 zone=inst.zone,
-                customer=inst.labels.get("customer", "unassigned"),
+                customer=inst.labels.get(CUSTOMER_LABEL_KEY, "unassigned"),
                 bot=inst.labels.get("bot", "unassigned"),
                 compliance_score=score,
                 passed_pillars=tuple(passed_pillars),
@@ -489,6 +539,28 @@ def audit_fleet_compliance(
     )
     max_bear = max((r.dov_bear_alarm_level for r in vm_results), default=0)
 
+    dov_handoff_message = ""
+    if max_bear > 0:
+        handoff = PeerBlackboardHandoff(
+            handoff_id=f"rox-dov-{project_id}-bear-{max_bear}",
+            source_agent="rox-bot",
+            target_agent="dov-bot",
+            status="action_required",
+            task_summary=(
+                f"GCP Fleet Audit on '{project_id}' triggered Bear Alarm {max_bear}/5 "
+                f"({total_vms - compliant_vms}/{total_vms} non-compliant VMs)."
+            ),
+            context={
+                "project_id": project_id,
+                "fleet_score": fleet_score,
+                "max_dov_bear_alarm": max_bear,
+                "alerts": list(dov_alerts),
+                "remediation_commands": list(all_remediations),
+            },
+            updated_at="2026-11-01T00:00:00Z",
+        )
+        dov_handoff_message = serialize_loop_data_block(build_peer_blackboard_block(handoff))
+
     return FleetAuditReport(
         project_id=project_id,
         fleet_score=fleet_score,
@@ -498,6 +570,7 @@ def audit_fleet_compliance(
         vm_results=tuple(vm_results),
         dov_alerts=tuple(dov_alerts),
         all_remediation_commands=tuple(all_remediations),
+        dov_handoff_message=dov_handoff_message,
     )
 
 
@@ -510,6 +583,7 @@ def fleet_audit_to_dict(report: FleetAuditReport) -> dict[str, Any]:
         "total_vm_count": report.total_vm_count,
         "max_dov_bear_alarm": report.max_dov_bear_alarm,
         "dov_alerts": list(report.dov_alerts),
+        "dov_handoff_message": report.dov_handoff_message,
         "all_remediation_commands": list(report.all_remediation_commands),
         "vm_results": [
             {
@@ -574,6 +648,16 @@ def render_fleet_audit_markdown(report: FleetAuditReport) -> str:
     if report.dov_alerts:
         for alert in report.dov_alerts:
             lines.append(f"- {alert}")
+        lines.extend(
+            [
+                "",
+                "### Peer Blackboard Handoff (`peer.blackboard.v1`)",
+                "",
+                "```json",
+                report.dov_handoff_message,
+                "```",
+            ]
+        )
     else:
         lines.append("- `@dov-bot` [🐻 Bear Alarm 0/5]: Entire fleet is 100% compliant.")
 
